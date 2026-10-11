@@ -94,6 +94,14 @@ type PostReceiveInfo struct {
 // is separate from the update, and deletes check the old value before a separate
 // removal. ReferenceStorer has no transaction covering these steps: callers must
 // serialize concurrent writers if they require the entire operation to be atomic.
+//
+// When the client requests the atomic capability, every command is checked
+// before any reference is written, and a command failing those checks refuses
+// the whole push: it reports its own reason and every other command reports
+// ErrAtomicPushFailure. If a write still fails once some commands were applied,
+// those are reverted and every other command reports
+// ErrAtomicTransactionFailed. Like the writes, the revert is not isolated from
+// concurrent writers.
 func ReceivePack(
 	ctx context.Context,
 	st storage.Storer,
@@ -505,84 +513,184 @@ func checkRefname(ref plumbing.ReferenceName) error {
 }
 
 func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+	if req.Capabilities.Supports(capability.Atomic) {
+		updateReferencesAtomic(st, req.Commands, cmdStatus, firstErr)
+		return
+	}
+
 	for _, cmd := range req.Commands {
-		if err := checkRefname(cmd.Name); err != nil {
+		current, err := checkCommand(st, cmd)
+		if err != nil {
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
 			continue
 		}
+		setStatus(cmdStatus, firstErr, cmd.Name, applyCommand(st, cmd, current))
+	}
+}
 
-		var current *plumbing.Reference
-		var err error
-		if cmd.Action() == packp.Create {
-			// An existing symbolic ref still occupies the name when its
-			// target is missing. A create must not overwrite that alias.
-			current, err = st.Reference(cmd.Name)
-		} else {
-			current, err = storer.ResolveReference(st, cmd.Name)
+// updateReferencesAtomic applies the commands of an atomic push all together or
+// not at all, following Git's execute_commands_atomic: a command that fails its
+// checks refuses the push before anything is written, and every other command
+// reports "atomic push failure"; a write that fails afterwards reports "atomic
+// transaction failed" for every other command.
+//
+// ReferenceStorer has no transaction to commit the writes as one, so a failed
+// write instead reverts the commands applied before it. If a revert fails too,
+// its error is joined into the one returned to the caller, which is then the
+// only signal that the push was left partly applied.
+//
+// https://github.com/git/git/blob/6de20f6092dcf9bdb1c8efe03db4b70c82b423dd/builtin/receive-pack.c#L2011-L2052
+func updateReferencesAtomic(st storage.Storer, cmds []*packp.Command, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+	currents := make([]*plumbing.Reference, len(cmds))
+	for i, cmd := range cmds {
+		current, err := checkCommand(st, cmd)
+		if err != nil {
+			refuseAtomic(cmds, cmdStatus, firstErr, cmd, err, ErrAtomicPushFailure)
+			return
 		}
-		exists := err == nil
-		if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
-			setStatus(cmdStatus, firstErr, cmd.Name, err)
+		currents[i] = current
+	}
+
+	for i, cmd := range cmds {
+		err := applyCommand(st, cmd, currents[i])
+		if err == nil {
 			continue
 		}
 
-		// A reference may only point at an object the repository holds. Git
-		// refuses "trying to write ref with nonexistent object" at the ref
-		// transaction (refs.c) and "missing necessary objects" at receive-pack
-		// (builtin/receive-pack.c), so a client cannot leave a ref dangling at
-		// an object the packfile never delivered. A valid push is unaffected —
-		// its objects are unpacked before this runs. A delete carries a zero
-		// New and is exempt.
-		if cmd.Action() != packp.Delete {
-			if err := st.HasEncodedObject(cmd.New); err != nil {
-				setStatus(cmdStatus, firstErr, cmd.Name, ErrMissingObject)
-				continue
+		refuseAtomic(cmds, cmdStatus, firstErr, cmd, err, ErrAtomicTransactionFailed)
+
+		// The status lines carry the write error alone. The revert errors only
+		// reach the caller, because an error's text goes verbatim into an
+		// "ng <ref> <reason>" line and errors.Join separates with newlines.
+		errs := []error{err}
+		for j := i - 1; j >= 0; j-- {
+			if rerr := revertCommand(st, cmds[j], currents[j]); rerr != nil {
+				errs = append(errs, fmt.Errorf("reverting %s: %w", cmds[j].Name, rerr))
 			}
 		}
+		*firstErr = errors.Join(errs...)
+		return
+	}
 
-		switch cmd.Action() {
-		case packp.Create:
-			if exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, ErrUpdateReference)
-				continue
-			}
+	for _, cmd := range cmds {
+		setStatus(cmdStatus, firstErr, cmd.Name, nil)
+	}
+}
 
-			ref := plumbing.NewHashReference(cmd.Name, cmd.New)
-			err := st.SetReference(ref)
-			setStatus(cmdStatus, firstErr, cmd.Name, err)
-		case packp.Delete:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, ErrUpdateReference)
-				continue
-			}
-
-			if current.Hash() != cmd.Old {
-				// Git permits removal of a corrupt ref when the supplied old
-				// object is missing. A present old object must match the ref.
-				// See https://github.com/git/git/blob/1630431f326e15fcde608827b5ff38422528eb59/builtin/receive-pack.c#L1604-L1619.
-				_, objectErr := st.EncodedObject(plumbing.AnyObject, cmd.Old)
-				if objectErr == nil {
-					setStatus(cmdStatus, firstErr, cmd.Name, storage.ErrReferenceHasChanged)
-					continue
-				}
-				if !errors.Is(objectErr, plumbing.ErrObjectNotFound) {
-					setStatus(cmdStatus, firstErr, cmd.Name, objectErr)
-					continue
-				}
-			}
-
-			err := st.RemoveReference(current.Name())
-			setStatus(cmdStatus, firstErr, cmd.Name, err)
-		case packp.Update:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, ErrUpdateReference)
-				continue
-			}
-
-			ref := plumbing.NewHashReference(current.Name(), cmd.New)
-			old := plumbing.NewHashReference(current.Name(), cmd.Old)
-			err := st.CheckAndSetReference(ref, old)
-			setStatus(cmdStatus, firstErr, cmd.Name, err)
+// refuseAtomic reports err for the failed command of an atomic push and others
+// for each of its other commands. The failed command is reported first so that
+// err, not others, is what the caller gets back.
+func refuseAtomic(cmds []*packp.Command, cmdStatus map[plumbing.ReferenceName]error, firstErr *error, failed *packp.Command, err, others error) {
+	setStatus(cmdStatus, firstErr, failed.Name, err)
+	for _, cmd := range cmds {
+		if cmd != failed {
+			setStatus(cmdStatus, firstErr, cmd.Name, others)
 		}
+	}
+}
+
+// checkCommand runs every check of cmd that does not write to st, and returns
+// the reference the command acts on: the resolved target for an update or a
+// delete, and nil for a create.
+func checkCommand(st storage.Storer, cmd *packp.Command) (*plumbing.Reference, error) {
+	if err := checkRefname(cmd.Name); err != nil {
+		return nil, err
+	}
+
+	var current *plumbing.Reference
+	var err error
+	if cmd.Action() == packp.Create {
+		// An existing symbolic ref still occupies the name when its
+		// target is missing. A create must not overwrite that alias.
+		current, err = st.Reference(cmd.Name)
+	} else {
+		current, err = storer.ResolveReference(st, cmd.Name)
+	}
+	exists := err == nil
+	if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return nil, err
+	}
+
+	// A reference may only point at an object the repository holds. Git
+	// refuses "trying to write ref with nonexistent object" at the ref
+	// transaction (refs.c) and "missing necessary objects" at receive-pack
+	// (builtin/receive-pack.c), so a client cannot leave a ref dangling at
+	// an object the packfile never delivered. A valid push is unaffected —
+	// its objects are unpacked before this runs. A delete carries a zero
+	// New and is exempt.
+	if cmd.Action() != packp.Delete {
+		if err := st.HasEncodedObject(cmd.New); err != nil {
+			return nil, ErrMissingObject
+		}
+	}
+
+	switch cmd.Action() {
+	case packp.Create:
+		if exists {
+			return nil, ErrUpdateReference
+		}
+		return nil, nil
+	case packp.Delete:
+		if !exists {
+			return nil, ErrUpdateReference
+		}
+
+		if current.Hash() != cmd.Old {
+			// Git permits removal of a corrupt ref when the supplied old
+			// object is missing. A present old object must match the ref.
+			// See https://github.com/git/git/blob/1630431f326e15fcde608827b5ff38422528eb59/builtin/receive-pack.c#L1604-L1619.
+			_, objectErr := st.EncodedObject(plumbing.AnyObject, cmd.Old)
+			if objectErr == nil {
+				return nil, storage.ErrReferenceHasChanged
+			}
+			if !errors.Is(objectErr, plumbing.ErrObjectNotFound) {
+				return nil, objectErr
+			}
+		}
+		return current, nil
+	case packp.Update:
+		if !exists {
+			return nil, ErrUpdateReference
+		}
+
+		// applyCommand compares and sets, which refuses this as well. Checking
+		// here too is what lets an atomic push refuse a stale update before
+		// any of its other commands is written.
+		if current.Hash() != cmd.Old {
+			return nil, storage.ErrReferenceHasChanged
+		}
+		return current, nil
+	default:
+		return nil, ErrUpdateReference
+	}
+}
+
+// applyCommand writes cmd to st. current is what checkCommand returned for it,
+// and checkCommand refuses every action but a create, a delete and an update.
+func applyCommand(st storage.Storer, cmd *packp.Command, current *plumbing.Reference) error {
+	switch cmd.Action() {
+	case packp.Create:
+		return st.SetReference(plumbing.NewHashReference(cmd.Name, cmd.New))
+	case packp.Delete:
+		return st.RemoveReference(current.Name())
+	default: // packp.Update, see checkCommand
+		ref := plumbing.NewHashReference(current.Name(), cmd.New)
+		old := plumbing.NewHashReference(current.Name(), cmd.Old)
+		return st.CheckAndSetReference(ref, old)
+	}
+}
+
+// revertCommand undoes applyCommand for cmd, putting back the reference that
+// checkCommand found.
+func revertCommand(st storage.Storer, cmd *packp.Command, current *plumbing.Reference) error {
+	switch cmd.Action() {
+	case packp.Create:
+		return st.RemoveReference(cmd.Name)
+	case packp.Delete:
+		return st.SetReference(plumbing.NewHashReference(current.Name(), current.Hash()))
+	default: // packp.Update, see checkCommand
+		ref := plumbing.NewHashReference(current.Name(), cmd.Old)
+		applied := plumbing.NewHashReference(current.Name(), cmd.New)
+		return st.CheckAndSetReference(ref, applied)
 	}
 }

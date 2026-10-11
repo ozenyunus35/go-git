@@ -34,6 +34,15 @@ var ErrDuplicateRefname = errors.New("multiple updates for ref not allowed")
 // refusal to point a reference at a nonexistent object.
 var ErrMissingObject = errors.New("missing necessary objects")
 
+// ErrAtomicPushFailure is reported for every command of an atomic push that
+// was refused because another of its commands failed, as Git reports it.
+var ErrAtomicPushFailure = errors.New("atomic push failure")
+
+// ErrAtomicTransactionFailed is reported for every command of an atomic push
+// whose reference updates failed partway through and were reverted, as Git
+// reports a failed commit of the push's reference transaction.
+var ErrAtomicTransactionFailed = errors.New("atomic transaction failed")
+
 // AdvertiseRefs is a server command that implements the reference
 // discovery phase of the v0/v1 Git transfer protocol. Protocol v2 advertises
 // capabilities only, via [AdvertiseCapabilities]; the sole reason this function
@@ -66,7 +75,7 @@ func AdvertiseRefs(
 	if forPush {
 		// TODO: support thin-pack
 		ar.Capabilities.Set(capability.NoThin)
-		// TODO: support atomic
+		ar.Capabilities.Set(capability.Atomic)
 		ar.Capabilities.Set(capability.DeleteRefs)
 		ar.Capabilities.Set(capability.ReportStatus)
 		ar.Capabilities.Set(capability.PushOptions)
